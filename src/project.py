@@ -30,7 +30,7 @@ def index(source):
     result = []
     for i, match in enumerate(slides(source), 1):
         node = html.fromstring(match.group())
-        title = ' '.join(node.xpath('.//h1//text()'))
+        title = ' '.join(node.xpath('.//h1//text()')) or ' '.join(node.xpath('.//p[1]//text()'))
         result.append({'slide': i, 'id': node.get('data-num', str(i)), 'title': title,
                        'source_sha256': digest(match.group())})
     return result
@@ -111,6 +111,30 @@ def patch_revision(root, payload):
     state['current'] = next_id
     save_json(state, Path(root) / 'project.json')
     return {'current': next_id, 'changed_slides': sorted(changed), 'source': str(dest / 'source.html')}
+
+
+def source_revision(root, base, text):
+    state, previous = revision(root)
+    if base != state['current']:
+        raise ValueError('Stale revision')
+    if not 1 <= len(slides(text)) <= 200 or len(text.encode()) > 2*1024*1024:
+        raise ValueError('Source limit exceeded')
+    before = [m.group() for m in slides((previous / 'source.html').read_text())]
+    after = [m.group() for m in slides(text)]
+    changed = [i for i, fragment in enumerate(after, 1) if i > len(before) or fragment != before[i-1]]
+    if len(before) != len(after):
+        changed = list(range(1, len(after)+1))
+    version = f"v{int(base[1:])+1:04d}"
+    folder = Path(root) / 'versions' / version
+    folder.mkdir(exist_ok=False)
+    (folder / 'source.html').write_text(text)
+    save_json(index(text), folder / 'index.json')
+    save_json({'version': version, 'parent': base, 'changed_slides': changed, 'message': 'Studio edit'}, folder / 'changes.json')
+    state['current'] = version
+    temporary = Path(root) / 'project.json.tmp'
+    save_json(state, temporary)
+    temporary.replace(Path(root) / 'project.json')
+    return {'current': version}
 
 
 def build(root):

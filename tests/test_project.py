@@ -32,3 +32,13 @@ def test_build_regression(tmp_path):
     assert result['regression']['unchanged_slides_checked']==[2]
     assert result['regression']['mismatches']==[]
     assert Path(result['pptx']).exists()
+
+
+def test_structural_revision_immutable_and_stale(tmp_path):
+    from project import source_revision
+    src=tmp_path/'in.html';src.write_text(SOURCE);root=tmp_path/'project';init(root,src)
+    source_revision(root,'v0001',SOURCE.replace('First slide','New title'))
+    assert (root/'versions/v0001/source.html').read_text()==SOURCE
+    assert inspect(root)['current']=='v0002'
+    with pytest.raises(ValueError):source_revision(root,'v0001',SOURCE)
+    with pytest.raises(ValueError):source_revision(root,'v0002','<html></html>')

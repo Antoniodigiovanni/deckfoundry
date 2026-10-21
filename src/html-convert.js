@@ -43,6 +43,7 @@ async function convert(input,output,count=5){
     }return;
    }
    const r=box(el),s=st(el);
+   if(el.tagName==='IMG' && /^data:image\/(png|jpeg);base64,[A-Za-z0-9+/=]+$/.test(el.getAttribute('src')||'')){items.push({type:'image',...r,data:el.getAttribute('src')});return;}
    if((!s.fill||s.fill.alpha===0)&&css.backgroundImage.includes('gradient')){const first=css.backgroundImage.match(/rgba?\([^)]*\)/);if(first)s.fill=color(first[0]);warnings.push('CSS gradient replaced by its first color');}
    if(el!==root&&r.w&&r.h&&s.fill&&s.fill.alpha>0)items.push({type:'rect',...r,fill:s.fill,stroke:null,width:0,radius:s.radius});
    if(el!==root&&r.w&&r.h){
@@ -74,7 +75,8 @@ async function convert(input,output,count=5){
  function styleColor(c){return c?{color:c.hex,transparency:Math.round(100*(1-c.alpha))}:{color:'000000',transparency:100}}
  for(const s of spec.slides){const slide=pptx.addSlide();slide.background={color:s.background};
  for(const item of s.items){
-  if(item.type==='text'){
+  if(item.type==='image'){slide.addImage({data:item.data,x:item.x*scale,y:item.y*scale,w:item.w*scale,h:item.h*scale});
+  }else if(item.type==='text'){
    const t=item.style;let x=item.x,y=item.y,w=item.w,h=item.h;
    if(Math.abs(item.rotation)===90){x=item.x+(item.w-item.h)/2;y=item.y+(item.h-item.w)/2;w=item.h;h=item.w;}
    slide.addText(item.text,{x:x*scale,y:y*scale,w:Math.max(.03,(w+3)*scale),h:(h+3)*scale,rotate:item.rotation?((item.rotation+360)%360):0,fontFace:'Arial',fontSize:t.size*.8,bold:t.bold,color:t.color?.hex||'FFFFFF',charSpacing:t.letterSpacing*.8,wrap:false,margin:0,breakLine:false,valign:'mid',paraSpaceAfterPt:0});

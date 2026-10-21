@@ -1,5 +1,11 @@
 """Local, serial DeckFoundry HTTP frontend. No third-party web dependencies."""
 import html
+import base64
+import io
+import zipfile
+from lxml import html as dom
+from pptx import Presentation
+from PIL import Image
 import ipaddress
 import http.cookies
 import json
@@ -23,7 +29,7 @@ SOURCE_LIMIT = 2 * 1024 * 1024
 ID = re.compile(r'[A-Za-z0-9_-]{1,80}\Z')
 VERSION = re.compile(r'v[0-9]{4,8}\Z')
 # Only leaf text elements are editable. Markup, attributes and layout stay intact.
-SLOT = re.compile(r'<(h1|h2|h3|p|li|aside|div)\b([^<>]*)>([^<>]+)</\1\s*>', re.I)
+SLOT = re.compile(r'<(h1|h2|h3|p|li|aside|div)\b([^<>]*)>([^<>]*)</\1\s*>', re.I)
 STATIC = Path(__file__).parent
 
 
@@ -50,6 +56,121 @@ def bounded_text(value, maximum=4000):
     if not isinstance(value, str) or len(value) > maximum or any(ord(c) < 32 and c not in '\n\t' for c in value):
         raise ValueError('Invalid text')
     return value
+
+
+BLANK = '<section class="slide" style="background:#ffffff"><h1>Untitled presentation</h1><p>Click to tell your story</p></section>'
+SHELL = '<html><head><style>.stage{width:1440px;height:810px}.slide{position:absolute;inset:0;padding:80px;box-sizing:border-box;font-family:Arial}.slide h1{font-size:52px}.slide p{font-size:28px;white-space:pre-wrap}</style></head><body><div class="stage">%s</div></body></html>'
+
+
+def safe_style(value):
+    result = {}
+    for key, val in re.findall(r'([a-z-]+)\s*:\s*([^;]+)', value or ''):
+        val = val.strip()
+        if key in ('color','background') and re.fullmatch(r'#[0-9a-fA-F]{6}', val):
+            result[key] = val
+        elif key == 'font-size' and re.fullmatch(r'(?:[1-9][0-9]?|1[0-5][0-9]|160)px', val):
+            result[key] = val
+        elif key == 'text-align' and val in ('left','center','right'):
+            result[key] = val
+        elif key in ('left','top','width','height') and re.fullmatch(r'[0-9]{1,4}(?:\.[0-9]+)?px', val):
+            result[key] = val
+    if 'left' in result or 'top' in result:
+        result['position'] = 'absolute'
+    return result
+
+
+def checked_image(raw):
+    try:
+        if len(raw)>1024*1024:
+            raise ValueError('Image size limit')
+        with Image.open(io.BytesIO(raw)) as image:
+            if image.format not in ('PNG','JPEG') or image.width*image.height>16000000:
+                raise ValueError('Image dimensions or format')
+            image.verify()
+    except Exception as exc:
+        raise ValueError('Import contains an invalid or oversized image') from exc
+    return raw
+
+
+def import_source(filename, raw):
+    if not isinstance(filename,str) or not re.fullmatch(r'[A-Za-z0-9 _.-]{1,100}',filename) or filename.startswith('.'):
+        raise ValueError('Use a simple filename without paths')
+    if not raw or len(raw)>8*1024*1024:
+        raise ValueError('Upload limit is 8 MiB')
+    sections=[]
+    suffix=Path(filename).suffix.lower()
+    if suffix in ('.html','.htm'):
+        if len(raw)>SOURCE_LIMIT:
+            raise ValueError('HTML limit is 2 MiB')
+        text=raw.decode('utf-8')
+        if '<!entity' in text.lower() or '<!doctype' in text.lower() and 'system' in text.lower():
+            raise ValueError('External declarations unsupported')
+        try:
+            tree=dom.fromstring(text)
+        except (ValueError, dom.etree.ParserError) as exc:
+            raise ValueError('Malformed HTML file') from exc
+        for bad in tree.xpath('//script|//style|//iframe|//object|//embed|//svg|//form'):
+            bad.drop_tree()
+        for node in tree.xpath('//section[contains(concat(" ",normalize-space(@class)," ")," slide ")]'):
+            children=[]
+            elements=node.xpath('.//h1|.//h2|.//h3|.//p|.//li')
+            if len(elements)>80: raise ValueError('Import has more than 80 elements on a slide')
+            for el in elements:
+                content=bounded_text(''.join(el.itertext()))
+                style=';'.join(k+':'+v for k,v in safe_style(el.get('style')).items())
+                children.append('<'+el.tag+' style="'+style+'">'+html.escape(content,quote=False)+'</'+el.tag+'>')
+            images=node.xpath('.//img')
+            if len(images)+len(elements)>80: raise ValueError('Import has more than 80 elements on a slide')
+            for image in images:
+                src=image.get('src','')
+                if len(src)<1400000 and re.fullmatch(r'data:image/(?:png|jpeg);base64,[A-Za-z0-9+/=]+',src):
+                    checked_image(base64.b64decode(src.split(',',1)[1],validate=True))
+                    style=';'.join(k+':'+v for k,v in safe_style(image.get('style')).items())
+                    children.append('<img style="'+style+'" src="'+src+'">')
+            section_style=';'.join(k+':'+v for k,v in safe_style(node.get('style')).items())
+            sections.append('<section class="slide" style="'+section_style+'">'+''.join(children)+'</section>')
+    elif suffix=='.pptx':
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                entries=archive.infolist()
+                if len(entries)>2000 or sum(e.file_size for e in entries)>32*1024*1024:
+                    raise ValueError('Expanded package exceeds limits')
+                for entry in entries:
+                    if entry.filename.startswith('/') or '..' in Path(entry.filename).parts or entry.flag_bits&1:
+                        raise ValueError('Unsafe package path')
+                    if entry.filename.endswith(('.xml','.rels')):
+                        part=archive.read(entry).upper()
+                        if b'<!DOCTYPE' in part or b'<!ENTITY' in part:
+                            raise ValueError('External declarations unsupported')
+            deck=Presentation(io.BytesIO(raw))
+            if not 1<=len(deck.slides)<=200:
+                raise ValueError('Slide limit exceeded')
+            for slide in deck.slides:
+                children=[]
+                if len(slide.shapes)>80: raise ValueError('Import has more than 80 elements on a slide')
+                for shape in slide.shapes:
+                    style=f'position:absolute;left:{shape.left/deck.slide_width*1440:.2f}px;top:{shape.top/deck.slide_height*810:.2f}px;width:{shape.width/deck.slide_width*1440:.2f}px;height:{shape.height/deck.slide_height*810:.2f}px'
+                    if shape.has_text_frame:
+                        runs=[r for p in shape.text_frame.paragraphs for r in p.runs]
+                        size=min(160,max(10,round(runs[0].font.size.pt*1.25))) if runs and runs[0].font.size else 28
+                        color='#172b4d'
+                        if runs:
+                            try: color='#'+str(runs[0].font.color.rgb) if runs[0].font.color.rgb else color
+                            except (AttributeError,ValueError): pass
+                        align=str(shape.text_frame.paragraphs[0].alignment)
+                        alignment='center' if 'CENTER' in align else 'right' if 'RIGHT' in align else 'left'
+                        children.append('<p style="'+style+f';font-size:{size}px;color:{color};text-align:{alignment}">'+html.escape(bounded_text(shape.text),quote=False)+'</p>')
+                    elif shape.shape_type==13 and shape.image.content_type in ('image/png','image/jpeg') and len(shape.image.blob)<1024*1024:
+                        children.append('<img style="'+style+'" src="data:'+shape.image.content_type+';base64,'+base64.b64encode(checked_image(shape.image.blob)).decode()+'">')
+                sections.append('<section class="slide">'+''.join(children)+'</section>')
+        except (zipfile.BadZipFile,KeyError,OSError,dom.etree.XMLSyntaxError) as exc:
+            raise ValueError('Malformed PowerPoint file') from exc
+    else:
+        raise ValueError('Choose an HTML or PPTX file')
+    source=SHELL % ''.join(sections)
+    if not 1<=len(sections)<=200 or len(source.encode())>SOURCE_LIMIT:
+        raise ValueError('Import needs 1–200 slides within 2 MiB editable source')
+    return source
 
 
 class App:
@@ -114,14 +235,106 @@ class App:
         slots = []
         for match in SLOT.finditer(fragments[slide-1].group()):
             tag, attrs, raw = match.groups()
-            if tag.lower() in ('aside', 'div') and not re.search(r'\b(?:speaker-notes|notes)\b', attrs):
-                continue
             if len(slots) >= 80 or len(raw) > 4000:
                 raise ValueError('Slide fields exceed limit')
-            slots.append({'kind': 'title' if tag.lower() == 'h1' else 'notes' if 'notes' in attrs else 'bullet' if tag.lower() == 'li' else 'text', 'old': raw, 'text': html.unescape(raw)})
+            slots.append({'kind': 'title' if tag.lower() == 'h1' else 'notes' if 'notes' in attrs else 'bullet' if tag.lower() == 'li' else 'text', 'old': raw, 'text': html.unescape(raw), 'style': safe_style(dom.fromstring(match.group()).get('style'))})
         return {'project': name, 'base': state['current'], 'slide': slide,
                 'slides': [x['title'][:200] for x in project.index(''.join(m.group() for m in fragments))],
+                'background': safe_style(dom.fromstring(fragments[slide-1].group()).get('style')).get('background','#ffffff'),
+                'images': [{'src':e.get('src'),'style':safe_style(e.get('style'))} for e in dom.fromstring(fragments[slide-1].group()).xpath('.//img') if re.fullmatch(r'data:image/(?:png|jpeg);base64,[A-Za-z0-9+/=]+',e.get('src',''))],
                 'fields': slots, 'unsupported': bool(state.get('brand'))}
+
+    def templates(self):
+        folder=self.path('_templates')
+        if not folder.exists():
+            return []
+        return [{'name':p.name} for p in itertools.islice(folder.iterdir(),1000) if not p.is_symlink() and p.is_file() and re.fullmatch(r'[A-Za-z0-9_-]{1,80}\.html',p.name)]
+
+    def create(self,data):
+        if set(data)-{'name','template','filename','content','kind'} or data.get('kind','project') not in ('project','template'):
+            raise ValueError('Invalid creation payload')
+        name=data.get('name','')
+        if not ID.fullmatch(name) or name.startswith('_'):
+            raise ValueError('Name needs letters, numbers, hyphens or underscores')
+        if data.get('kind')=='template' and not data.get('filename'):
+            raise ValueError('Choose a file to add a template')
+        source=SHELL % BLANK
+        raw=None
+        if data.get('template'):
+            filename=data['template']
+            if filename not in {t['name'] for t in self.templates()}:
+                raise ValueError('Template unavailable')
+            template=self.path('_templates',filename)
+            if template.stat().st_size>SOURCE_LIMIT: raise ValueError('Template exceeds 2 MiB')
+            source=import_source(filename,template.read_bytes())
+        elif data.get('filename'):
+            raw=base64.b64decode(data.get('content',''),validate=True)
+            source=import_source(data['filename'],raw)
+        if data.get('kind')=='template':
+            self.path('_templates').mkdir(exist_ok=True)
+            with self.path('_templates',name+'.html').open('x') as output:
+                output.write(source)
+            return {'template':name+'.html'}
+        root=self.path(name)
+        if root.exists():
+            raise ValueError('This project name is already in use')
+        root.mkdir()
+        original=root/'import.html';original.write_text(source)
+        project.init(root,original)
+        if raw is not None:
+            (root/('original'+Path(data['filename']).suffix.lower())).write_bytes(raw)
+        return {'project':name}
+
+    def edit(self,data):
+        root,state,fragments=self.load(data['project'])
+        if data.get('base')!=state['current']:
+            raise Conflict()
+        n=data.get('slide')
+        if type(n) is not int or not 1<=n<=len(fragments):
+            raise ValueError('Invalid slide')
+        source=(project.revision(root)[1]/'source.html').read_text()
+        parts=[m.group() for m in fragments]
+        action=data.get('action')
+        if action in ('add','duplicate'):
+            parts.insert(n,BLANK if action=='add' else parts[n-1])
+        elif action=='delete':
+            if len(parts)==1: raise ValueError('Keep at least one slide')
+            parts.pop(n-1)
+        elif action in ('up','down'):
+            target=n-2 if action=='up' else n
+            if not 0<=target<len(parts): raise ValueError('Slide is already at the edge')
+            parts[n-1],parts[target]=parts[target],parts[n-1]
+        elif action=='format':
+            edits=data.get('edits',[data])
+            if not isinstance(edits,list) or not 1<=len(edits)<=81:
+                raise ValueError('Invalid edits')
+            for edit in edits:
+                if not isinstance(edit,dict): raise ValueError('Invalid edit')
+                styles=edit.get('styles',{})
+                if not isinstance(styles,dict) or set(styles)-{'font-size','color','text-align','background'}:
+                    raise ValueError('Invalid properties')
+                if safe_style(';'.join(k+':'+str(v) for k,v in styles.items()))!=styles:
+                    raise ValueError('Invalid property value')
+                ix=edit.get('field')
+                if ix is None:
+                    if set(styles)!={'background'}: raise ValueError('Select an element')
+                    node=dom.fromstring(parts[n-1])
+                    current=dict(re.findall(r'([a-z-]+)\s*:\s*([^;]+)',node.get('style','')));current.update(styles)
+                    node.set('style',';'.join(k+':'+v for k,v in current.items()));parts[n-1]=dom.tostring(node,encoding='unicode')
+                else:
+                    fields=list(SLOT.finditer(parts[n-1]))
+                    if type(ix) is not int or not 0<=ix<len(fields): raise ValueError('Invalid element')
+                    match=fields[ix];node=dom.fromstring(match.group())
+                    current=dict(re.findall(r'([a-z-]+)\s*:\s*([^;]+)',node.get('style','')));current.update(styles)
+                    node.set('style',';'.join(k+':'+v for k,v in current.items()))
+                    if 'text' in edit: node.text=bounded_text(edit['text'])
+                    parts[n-1]=parts[n-1][:match.start()]+dom.tostring(node,encoding='unicode')+parts[n-1][match.end():]
+        else: raise ValueError('Unknown slide action')
+        # Keep the original shell and replace slide ranges in place.
+        for i,match in reversed(list(enumerate(fragments))):
+            replacement=''.join(parts[i:]) if i==len(fragments)-1 else parts[i] if i<len(parts) else ''
+            source=source[:match.start()]+replacement+source[match.end():]
+        return project.source_revision(root,state['current'],source)
 
     def validate_ops(self, view, ops):
         if not isinstance(ops, list) or not 1 <= len(ops) <= 40:
@@ -167,7 +380,7 @@ class App:
         key = os.environ.get('HERMES_API_KEY', '')
         url = parse.urlsplit(base)
         if url.scheme not in ('http', 'https') or not url.netloc or not url.hostname or url.username or url.password or url.query or url.fragment or not key:
-            raise ValueError('Hermes is not configured')
+            raise ValueError('Chat is not configured')
         if url.scheme == 'http':
             try:
                 address = ipaddress.ip_address(url.hostname)
@@ -177,10 +390,10 @@ class App:
                 local = url.hostname.lower() == 'localhost'
                 private = False
             if not local and not (private and os.environ.get('HERMES_API_ALLOW_PRIVATE_HTTP') == '1'):
-                raise ValueError('Non-loopback Hermes endpoints require HTTPS unless private HTTP is explicitly enabled')
+                raise ValueError('Non-loopback chat endpoints require HTTPS unless private HTTP is explicitly enabled')
         model = bounded_text(os.environ.get('HERMES_API_MODEL', 'hermes-agent'), 120)
         if not model.strip():
-            raise ValueError('Hermes model is not configured')
+            raise ValueError('Chat model is not configured')
         context = (data['project'], data['slide'], data['base'])
         if session.get('context') != context:
             session['history'] = []
@@ -201,7 +414,7 @@ class App:
         with request.build_opener(request.ProxyHandler({}), NoRedirect).open(req, timeout=30) as response:
             raw = response.read(LIMIT + 1)
         if len(raw) > LIMIT:
-            raise ValueError('Hermes response too large')
+            raise ValueError('Chat response too large')
         answer = json.loads(json.loads(raw)['choices'][0]['message']['content'])
         if not isinstance(answer, dict) or set(answer) != {'message', 'ops'}:
             raise ValueError('Invalid proposal')
@@ -248,7 +461,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header('Content-Type', content_type)
         self.send_header('Content-Length', str(len(body)))
-        for k, v in {'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'", 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY', 'Permissions-Policy': 'camera=(), microphone=(), geolocation=()'}.items():
+        for k, v in {'Content-Security-Policy': "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'", 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY', 'Permissions-Policy': 'camera=(), microphone=(), geolocation=()'}.items():
             self.send_header(k, v)
         if cookie:
             self.send_header('Set-Cookie', cookie)
@@ -296,12 +509,27 @@ class Handler(BaseHTTPRequestHandler):
                 if self.headers.get('Content-Type') != 'application/json' or self.headers.get('Transfer-Encoding'):
                     raise ValueError('JSON required')
                 length = int(self.headers.get('Content-Length', '0'))
-                if not 0 < length <= LIMIT:
+                if not 0 < length <= (12*1024*1024 if path == '/api/create' else LIMIT):
                     raise ValueError('Payload limit exceeded')
                 data = json.loads(self.rfile.read(length))
                 if not isinstance(data, dict):
                     raise ValueError('Object required')
-                if path == '/api/apply':
+                if path == '/api/create':
+                    try:
+                        result = app.create(data)
+                    except ValueError as exc:
+                        messages = ('Use ', 'Upload ', 'HTML ', 'External ', 'Expanded ', 'Unsafe ', 'Malformed ', 'Choose ', 'Import ', 'Name ', 'This ', 'Template ')
+                        message = str(exc)
+                        return self.send(400, {'error': message if message.startswith(messages) else 'Malformed or unsupported upload; choose UTF-8 HTML or a standard PPTX file'})
+                    except FileExistsError:
+                        return self.send(400, {'error': 'This name is already in use'})
+                elif path == '/api/edit':
+                    try:
+                        result = app.edit(data)
+                    except ValueError as exc:
+                        message=str(exc)
+                        return self.send(400, {'error': message if message.startswith(('Keep ', 'Slide is ', 'Invalid property', 'Source limit')) else 'Edit could not be saved. Check selected elements and property limits.'})
+                elif path == '/api/apply':
                     result = app.apply(data)
                 elif path == '/api/chat':
                     result = app.chat(session, data)
@@ -316,7 +544,7 @@ class Handler(BaseHTTPRequestHandler):
                     try:
                         build_project(root)
                     except (subprocess.SubprocessError, OSError):
-                        return self.send(422, {'error': 'Build failed; inspect locally and rebuild. Visual review required.'})
+                        return self.send(422, {'error': 'Build failed. Check that Chromium, LibreOffice and Poppler are available to the service, then retry. Custom layouts may require local review.'})
                     result = {'message': 'Build complete. Visual review required.'}
                 else:
                     return self.send(404, {'error': 'Not found'})
@@ -326,12 +554,15 @@ class Handler(BaseHTTPRequestHandler):
             elif path == '/api/projects':
                 names = []
                 for entry in itertools.islice(app.root.iterdir(), 1000):
+                    if entry.name == '_templates': continue
                     try:
                         _, state, _ = app.load(entry.name)
                         names.append({'name': entry.name, 'current': state['current'], 'unsupported': bool(state.get('brand'))})
                     except (ValueError, OSError, KeyError, TypeError):
                         continue
                 result = {'projects': names, 'csrf': session['csrf']}
+            elif path == '/api/templates':
+                result = {'templates': app.templates()}
             elif path == '/api/slide':
                 q = parse.parse_qs(url.query, strict_parsing=True)
                 result = app.view(q['project'][0], int(q['slide'][0]))

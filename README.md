@@ -1,57 +1,55 @@
 # DeckFoundry
 
-Local presentation engine and a deployable v0 web frontend for existing HTML-source projects. The frontend lists projects, navigates slides, provides a safe text preview, edits existing title/text/bullet/notes fields, and creates immutable source revisions through `src/project.py patch_revision`. It does not import or edit arbitrary PPTX files. Simple leaf `h1`, `h2`, `h3`, `p`, `li`, and notes elements are editable; nested markup and missing fields need an offline source workflow.
+A private, single-user presentation studio with a project library, editable slide canvas, compact inspector, and an overlay conversation pane. Start blank, import UTF-8 HTML or PowerPoint, or select a reusable local template. Click text to edit, change basic typography and background in the inspector, and save a new revision. Add, duplicate, remove, and move slides using the toolbar. Alt+Left/Right navigates slides; Ctrl/Cmd+S saves. Navigation saves pending edits first. A failed save preserves local edits for review; a stale revision must be reloaded before saving again.
 
-## Setup and local use
+## Local setup
 
-Requires Python 3.10+, Node 20+, and the existing engine dependencies:
+Requires Python 3.10+, Node 20+, and the existing dependencies:
 
 ```sh
 python3 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
 npm ci
-PLAYWRIGHT_BROWSERS_PATH=/opt/deckfoundry/.cache/ms-playwright npx playwright install chromium
-# Install LibreOffice Impress, Poppler and suitable fonts using your OS package manager.
+# Provision Playwright Chromium, LibreOffice Impress, Poppler, and suitable fonts.
 DECKFOUNDRY_PROJECTS_DIR=/var/lib/deckfoundry/projects .venv/bin/python web/app.py
 ```
 
-Open http://127.0.0.1:8080. The projects directory must already exist. Only direct child directories with HTML-authority `project.json` metadata and a current `versions/vNNNN/source.html` are listed. The app does not create or import projects. For trusted local source, the CLI supports:
+The private data directory must already exist. Open http://127.0.0.1:8080. Run one process only: the server serializes writes and builds. Do not run CLI writers concurrently. No deployment configuration is changed by the studio.
 
-```sh
-.venv/bin/python src/project.py init projects/NAME input.html
-.venv/bin/python src/project.py inspect projects/NAME --slide 1
-.venv/bin/python src/project.py build projects/NAME
-```
+## Imports and templates
 
-Apply explicitly creates a new source version; old versions remain intact. Stale edits fail with HTTP 409; reload and review again. Downloads refer only to the current version, and return an error until the artifact exists. Build/rebuild calls the existing project CLI, may refresh current-version build artifacts, and requires visual review. Text previews deliberately do not execute source HTML or reproduce layout. Branded projects remain visible with an unsupported build warning; the engine's brand guard is never bypassed. Arbitrary slide insertion, layout editing, and PPTX-authority editing are unsupported.
+HTML must contain 1–200 `section.slide` elements. Import reconstructs text from headings, paragraphs and list items, retaining supported inline font sizes, colors, alignment and position. Scripts, embedded documents, arbitrary stylesheets, SVG, forms, external resources and unsupported markup are discarded. Embedded PNG/JPEG data images are retained; linked HTML images are omitted. This is a simplified editable import, not a faithful browser snapshot. Source uploads must be valid UTF-8 and fit within 2 MiB.
 
-## Hermes
+PPTX import uses the existing Python presentation parser. It retains slide order, text boxes, basic positions, explicit font size/color/alignment, and common PNG/JPEG pictures. It does not reproduce masters, theme inheritance, charts, tables, grouped shapes, animations, advanced effects, rich text runs or uncommon fonts. Backgrounds default to white. Inspect the result before exporting; full PowerPoint fidelity is not supported. Embedded packages are never extracted or executed. Upload limit is 8 MiB; ZIP packages are bounded to 2,000 entries and 32 MiB expanded data. Each slide permits 80 elements and each text field 4,000 characters. Imports that exceed the editable 2 MiB source limit are rejected. Picture data increases that size.
 
-Set `HERMES_API_BASE_URL` to the API's OpenAI-compatible base URL (including `/v1` if required), `HERMES_API_MODEL` to a model listed by that endpoint (default `hermes-agent`), and `HERMES_API_KEY` in the server environment. Requests go server to server to `/chat/completions`; the browser never receives the configured key. Plain HTTP is accepted only for loopback endpoints by default. For a trusted private-network Hermes endpoint, explicitly set `HERMES_API_ALLOW_PRIVATE_HTTP=1`; use HTTPS for public/remote endpoints. Validate this endpoint against your Hermes installation. Responses must contain JSON content with a bounded `message` and nullable `ops` array. Each operation is `{slide, old, new}` using an exact active field source literal and HTML-escaped replacement text. Proposals appear pending until explicitly applied through the same validation and revision path as direct edits.
+Choose “Add to reusable templates” when importing a user-owned file. Templates are normalized HTML in `_templates/` inside the configured private data root and are excluded from presentation listings. An absent directory is an empty library; no example templates are supplied. Template selection creates an independent project. Use simple local filenames and project names containing letters, digits, underscores or hyphens. Symlinks and path escapes are rejected. Imported projects preserve the original upload alongside the normalized source. Templates store only the normalized reusable source.
 
-Configure the **Hermes API server** toolsets deliberately. The default API-server toolset can access the host, including files and terminal execution. This app does not enforce or reduce those privileges: Cloudflare Access controls who may reach the app, but any authorized user can send requests to the connected Hermes agent. Use the existing full-tool API only if that capability is intended for the protected users; otherwise configure a restricted `platform_toolsets.api_server` (for example `[web]`) and verify it before connecting. A prompt asking the agent not to use tools is not a security boundary.
+All uploads, templates, sources, revisions and exports are private runtime data. Keep the data directory outside application source control. Never stage user decks or templates.
 
-Only the selected project name, revision, active slide fields and bounded session conversation are sent, not other slides or project files. Context resets when project, slide or revision changes. Prompts and slide content may be processed by Hermes's configured model provider. Sessions are in memory, expire after an hour of inactivity, and disappear on restart. Authenticate each user separately at the reverse proxy; do not share browser sessions.
+## Editing, preview and export
 
-## Deployment
+The canvas renders structured text and supported images using DOM text nodes and a small validated CSS property set. Imported markup never becomes executable browser HTML. The inspector edits text, font size, text color, alignment and slide background. Save writes all pending fields into one new source revision; old source versions remain intact. Slide actions also create revisions. There is no whole-document undo/redo; browser text editing supports its native local undo before saving.
 
-Use a dedicated unprivileged account and a separately configured authenticated HTTPS reverse proxy. Bind defaults to `127.0.0.1`; do not expose this unauthenticated backend publicly. Have the proxy enforce authentication, request size limits, rate limits, connection limits, and an upstream timeout of at least 460 seconds for builds. Keep it on loopback and strip untrusted forwarding headers. The app validates `Host` and `Origin`; set `DECKFOUNDRY_ALLOWED_ORIGINS` to the exact external origin(s), comma-separated, when using a reverse proxy. No CORS access is enabled. Use `DECKFOUNDRY_SECURE_COOKIE=1` behind HTTPS (leave unset for direct local HTTP).
+Existing HTML-source projects retain their document shell and unsupported styles in source. Their canvas shows a simplified representation because arbitrary CSS/layout is deliberately not executed. The complete deck preview uses the same safe representation. Build runs the existing conversion/validation/rendering pipeline and creates current-version PowerPoint, PDF and source previews. Downloads are available after a successful build. Builds can take several minutes. Review output visually; package validation cannot certify layout fidelity. Branded projects retain their build guard and require their existing custom adapter.
 
-`deploy/deckfoundry.env.example` documents environment settings without credentials. Store the real environment file outside the repository with mode 0600; supply the key there. Adapt `deploy/deckfoundry.service` paths and account to your installation, install Chromium into the configured `/opt/deckfoundry/.cache/ms-playwright` path before enabling the service, then install/enable it yourself. Provision engine browser/system dependencies for that account. The service template limits write access to the projects directory; validate the sandbox with your renderer. This repository does not install services.
+Conversation requests contain only the active project name, revision, slide fields and bounded session history. The configured server-side chat connection and key handling are unchanged; secrets never reach the browser. The API currently returns a complete response rather than a stream. The pane shows progress, errors and retry. Proposed edits are text-only, validated against active fields and displayed for explicit apply or reject. Applying saves a revision and refreshes the canvas. Editing or navigating invalidates pending proposals. Nothing is applied automatically. Conversation history resets with project, slide or revision; the pane may retain readable earlier messages during the browser session.
 
-The v0 server is intentionally serial, providing one app writer and one build at a time. Run **one process only**, and do not run CLI writers or change project files while it runs. Treat projects and their HTML/CSS as trusted local input to the build engine; OS account isolation is still needed for rendering. Symlinks anywhere in a managed project are rejected. Administrators must keep the root and its parents stable and deny other users write access. This is not a sandbox for hostile project owners.
+## Security and operation
 
-Limits: 64 KiB JSON requests/upstream responses; 2 MiB source; 200 slides; 80 fields per active slide; 40 edits per apply; 4,000 characters per field; 2,000 per chat prompt; eight conversation messages; 256 sessions; 1,000 project candidates; 10,000 filesystem entries per project; 64 MiB downloads. Socket idle timeout is 10 seconds, Hermes timeout 30 seconds, and build deadline 450 seconds. The frontend serves strict CSP and other security headers and requires a session CSRF token for writes. Source HTML is never served.
+Keep the backend bound to loopback behind the separately managed authenticated HTTPS reverse proxy. The backend is not an authentication service. Preserve existing host/origin allowlisting, secure cookies and proxy authentication. `DECKFOUNDRY_ALLOWED_ORIGINS` accepts exact comma-separated origins; `DECKFOUNDRY_SECURE_COOKIE=1` enables secure cookies behind HTTPS. Every mutation requires a valid session CSRF token and matching Origin/Host. Read requests also enforce Host and any supplied Origin. Responses are no-store with strict CSP and security headers; no source HTML route is exposed.
 
-## Engine and tests
+Sessions expire after one idle hour, are bounded to 256, and vanish on restart. Chat prompts are limited to 2,000 characters, responses to 64 KiB and history to eight messages. Ordinary JSON writes are limited to 64 KiB; import JSON is limited to 12 MiB to accommodate base64. There are at most 200 slides, 1,000 library candidates, 10,000 entries per project and 64 MiB per download. Keep the private data root and its parents stable and inaccessible to other writers.
 
-The engine retains scratch generation, template inheritance, validation, HTML conversion, and PDF/PNG rendering via its CLI. Build output remains editable in PowerPoint, with converter limitations and visual review requirements. Package checks do not certify layout fidelity or factual correctness. Renderer installation is required for integration tests.
+The converter disables page JavaScript and denies network requests. Existing locally provisioned source still runs through a browser layout engine and native document renderer during builds; retain OS account isolation. The connected chat server's independent tool privileges are not controlled by this app. Keep its existing configuration and access boundaries under separate administration.
+
+## Verification
 
 ```sh
 .venv/bin/python -m pytest tests -q
 npm test
-node --check src/html-convert.js
 node --check web/app.js
+node --check src/html-convert.js
+git diff --check
 ```
 
-Tests use temporary generic fixtures. Keep templates, presentation sources/specs, project data, generated artifacts, credentials, and caches out of public Git history. Ignore rules do not remove already tracked files; review an explicit allowlist of changes before staging. Do not commit sensitive pre-existing tracked data.
+Tests create generic temporary fixtures and mock chat responses; they do not need private project data or live model requests. Renderer integration tests require a functioning Chromium installation and LibreOffice/Poppler. A restricted execution environment may prevent Chromium startup even when installed.

@@ -278,3 +278,115 @@ def test_private_hermes_bridge_requires_explicit_opt_in(app, monkeypatch):
     answer = app.chat({'history': []}, data)
     assert answer == {'message': 'Ready', 'ops': None}
     assert calls == ['http://172.17.0.1:8642/v1/chat/completions']
+
+
+def upload(name='imported', filename='input.html', raw=SOURCE.encode(), kind='project'):
+    return {'name': name, 'filename': filename, 'content': web.base64.b64encode(raw).decode(), 'kind': kind}
+
+
+def test_create_template_select_and_private_original(client, app):
+    cookie, csrf = session(client)
+    assert json.loads(client('/api/templates')[2]) == {'templates': []}
+    assert client('/api/create', upload('theme', kind='template'), cookie, csrf)[0] == 200
+    listing = json.loads(client('/api/templates')[2])['templates']
+    assert listing == [{'name': 'theme.html'}]
+    assert client('/api/create', {'name':'from-template','template':'theme.html'}, cookie, csrf)[0] == 200
+    assert app.view('from-template', 1)['fields'][0]['text'] == 'Title'
+    names = [p['name'] for p in json.loads(client('/api/projects')[2])['projects']]
+    assert '_templates' not in names and 'theme' not in names
+    assert client('/api/create', upload(), cookie, csrf)[0] == 200
+    assert (app.root/'imported/original.html').read_bytes() == SOURCE.encode()
+    assert client('/api/create', upload(), cookie, csrf)[0] == 400
+    assert client('/api/create', {'name':'blank'}, cookie, csrf)[0] == 200
+
+
+@pytest.mark.parametrize('path,data', [
+    ('/api/create', {'name':'new'}),
+    ('/api/edit', {'project':'generic','base':'v0001','slide':1,'action':'add'}),
+])
+def test_new_routes_require_origin_session_csrf(client, path, data):
+    cookie, csrf = session(client)
+    assert client(path, data)[0] == 403
+    assert client(path, data, cookie, csrf, origin=None)[0] == 403
+    assert client(path, data, cookie, csrf, origin='https://evil.example')[0] == 403
+    assert client(path, data, cookie, csrf)[0] == 200
+    assert client('/api/templates', host='evil.example')[0] == 403
+
+
+@pytest.mark.parametrize('filename,raw', [
+    ('../escape.html', SOURCE.encode()), ('x.svg', b'<svg/>'),
+    ('x.html', b'<html>no slides</html>'), ('x.pptx', b'not a package'),
+    ('x.html', b'\xff'), ('x.html', b'x'*(web.SOURCE_LIMIT+1)),
+    ('x.html', b'<!DOCTYPE html SYSTEM "file:///etc/passwd"><section class="slide"><p>x</p></section>'),
+])
+def test_import_rejections(client, filename, raw):
+    cookie, csrf = session(client)
+    assert client('/api/create', upload(filename=filename, raw=raw), cookie, csrf)[0] == 400
+    assert not (client.app.root/'imported').exists()
+
+
+def test_import_strips_active_content_and_remote_resources(app):
+    raw=b'<section class="slide" onclick="alert(1)"><h1 style="color:#112233;background:url(https://evil.example)">Safe<script>bad()</script></h1><iframe src="file:///secret"></iframe><img src="https://evil.example/a"><p onmouseover="bad()">Text</p></section>'
+    text=web.import_source('safe.html', raw)
+    assert all(x not in text for x in ('script','iframe','evil.example','onclick','onmouseover'))
+    assert 'color:#112233' in text and 'Safe' in text
+
+
+def test_pptx_sequence_geometry_images_and_bad_zip(app):
+    from pptx import Presentation
+    from pptx.util import Inches
+    from PIL import Image
+    deck=Presentation()
+    for title in ('Opening','Closing'):
+        slide=deck.slides.add_slide(deck.slide_layouts[6])
+        shape=slide.shapes.add_textbox(Inches(1), Inches(1), Inches(3), Inches(1))
+        shape.text=title
+    picture=io.BytesIO();Image.new('RGB',(10,10),'red').save(picture,format='PNG');picture.seek(0)
+    deck.slides[0].shapes.add_picture(picture, Inches(2), Inches(3), width=Inches(1))
+    raw=io.BytesIO();deck.save(raw)
+    app.create(upload(raw=raw.getvalue(),filename='deck.pptx'))
+    view=app.view('imported',1)
+    assert view['fields'][0]['text']=='Opening'
+    assert view['fields'][0]['style']['left'].endswith('px')
+    assert view['images'][0]['src'].startswith('data:image/png;base64,')
+    assert app.view('imported',2)['fields'][0]['text']=='Closing'
+    bad=io.BytesIO()
+    with web.zipfile.ZipFile(bad,'w') as archive:
+        archive.writestr('../escape.xml','<x/>')
+    with pytest.raises(ValueError): web.import_source('bad.pptx',bad.getvalue())
+
+
+def test_format_batch_atomic_stale_and_slide_actions(client,app):
+    cookie,csrf=session(client)
+    data={'project':'generic','base':'v0001','slide':1,'action':'format','edits':[
+        {'field':0,'text':'Edited <safe>','styles':{'font-size':'60px','color':'#123456','text-align':'center'}},
+        {'styles':{'background':'#abcdef'}}]}
+    assert client('/api/edit',data,cookie,csrf)[0]==200
+    view=app.view('generic',1)
+    assert view['base']=='v0002' and view['background']=='#abcdef'
+    assert view['fields'][0]['text']=='Edited <safe>'
+    assert view['fields'][0]['style']['font-size']=='60px'
+    assert client('/api/edit',data,cookie,csrf)[0]==409
+    data['base']='v0002';data['edits'][1]={'field':500,'text':'bad'}
+    assert client('/api/edit',data,cookie,csrf)[0]==400
+    assert app.view('generic',1)['base']=='v0002'
+    for action,count in [('duplicate',3),('down',3),('up',3),('delete',2),('add',3)]:
+        data={'project':'generic','base':app.view('generic',1)['base'],'slide':2 if action=='up' else 1,'action':action}
+        assert client('/api/edit',data,cookie,csrf)[0]==200
+        assert len(app.view('generic',1)['slides'])==count
+    assert (app.root/'generic/versions/v0001/source.html').read_text()==SOURCE
+
+
+def test_template_symlinks_and_selection_escape(app,tmp_path):
+    folder=app.root/'_templates';folder.mkdir()
+    (folder/'escape.html').symlink_to(tmp_path/'outside')
+    assert app.templates()==[]
+    for name in ('../outside.html','escape.html'):
+        with pytest.raises(ValueError):app.create({'name':'new','template':name})
+
+
+def test_format_rejects_css_and_markup(client):
+    cookie,csrf=session(client)
+    for styles in ({'color':'url(https://evil.example)'},{'font-size':'999px'},{'position':'fixed'}):
+        data={'project':'generic','base':'v0001','slide':1,'action':'format','field':0,'styles':styles}
+        assert client('/api/edit',data,cookie,csrf)[0]==400
