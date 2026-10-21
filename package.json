@@ -1,0 +1,15 @@
+{
+  "name": "deckfoundry",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local presentation generation and revision tools",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --check src/generate.js"
+  },
+  "overrides": {"image-size": "2.0.4"},
+  "dependencies": {
+    "playwright": "1.64.0",
+    "pptxgenjs": "4.0.0"
+  }
+}

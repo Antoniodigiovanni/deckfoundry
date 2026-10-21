@@ -1,0 +1,22 @@
+[Unit]
+Description=DeckFoundry local web frontend
+After=network.target
+
+[Service]
+Type=simple
+User=deckfoundry
+Group=deckfoundry
+WorkingDirectory=/opt/deckfoundry
+EnvironmentFile=/etc/deckfoundry/environment
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/deckfoundry/.cache/ms-playwright
+ExecStart=/opt/deckfoundry/.venv/bin/python web/app.py
+Restart=on-failure
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/deckfoundry/projects
+
+[Install]
+WantedBy=multi-user.target
