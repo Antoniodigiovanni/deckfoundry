@@ -170,11 +170,14 @@ class App:
             raise ValueError('Hermes is not configured')
         if url.scheme == 'http':
             try:
-                loopback = ipaddress.ip_address(url.hostname).is_loopback
+                address = ipaddress.ip_address(url.hostname)
+                local = address.is_loopback
+                private = address.is_private
             except ValueError:
-                loopback = url.hostname.lower() == 'localhost'
-            if not loopback:
-                raise ValueError('Remote Hermes endpoints require HTTPS')
+                local = url.hostname.lower() == 'localhost'
+                private = False
+            if not local and not (private and os.environ.get('HERMES_API_ALLOW_PRIVATE_HTTP') == '1'):
+                raise ValueError('Non-loopback Hermes endpoints require HTTPS unless private HTTP is explicitly enabled')
         model = bounded_text(os.environ.get('HERMES_API_MODEL', 'hermes-agent'), 120)
         if not model.strip():
             raise ValueError('Hermes model is not configured')

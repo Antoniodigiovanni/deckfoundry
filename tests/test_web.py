@@ -255,3 +255,26 @@ def test_http_chat_refuses_remote_endpoint(app, monkeypatch):
     with pytest.raises(ValueError):
         app.chat({'history': []}, {'project': 'generic', 'slide': 1, 'base': 'v0001', 'message': 'Help'})
     assert calls == []
+
+
+def test_private_hermes_bridge_requires_explicit_opt_in(app, monkeypatch):
+    calls = []
+
+    class Mock:
+        def open(self, req, timeout):
+            calls.append(req.full_url)
+            payload = {'choices': [{'message': {'content': json.dumps({'message': 'Ready', 'ops': None})}}]}
+            return io.BytesIO(json.dumps(payload).encode())
+
+    monkeypatch.setattr(web.request, 'build_opener', lambda *a: Mock())
+    monkeypatch.setenv('HERMES_API_BASE_URL', 'http://172.17.0.1:8642/v1')
+    monkeypatch.setenv('HERMES_API_KEY', 'mock-server-only-key')
+    data = {'project': 'generic', 'slide': 1, 'base': 'v0001', 'message': 'Hello'}
+    with pytest.raises(ValueError):
+        app.chat({'history': []}, data)
+    assert calls == []
+
+    monkeypatch.setenv('HERMES_API_ALLOW_PRIVATE_HTTP', '1')
+    answer = app.chat({'history': []}, data)
+    assert answer == {'message': 'Ready', 'ops': None}
+    assert calls == ['http://172.17.0.1:8642/v1/chat/completions']

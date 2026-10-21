@@ -27,17 +27,9 @@ Apply explicitly creates a new source version; old versions remain intact. Stale
 
 ## Hermes
 
-Set `HERMES_API_BASE_URL` to the API's OpenAI-compatible base URL (including `/v1` if required), `HERMES_API_MODEL` to a model listed by that endpoint (default `hermes-agent`), and `HERMES_API_KEY` in the server environment. Requests go server to server to `/chat/completions`; the browser never receives the configured key. Plain HTTP is accepted only for loopback endpoints; use HTTPS for a remote Hermes API. Validate this endpoint against your Hermes installation. Responses must contain JSON content with a bounded `message` and nullable `ops` array. Each operation is `{slide, old, new}` using an exact active field source literal and HTML-escaped replacement text. Proposals appear pending until explicitly applied through the same validation and revision path as direct edits.
+Set `HERMES_API_BASE_URL` to the API's OpenAI-compatible base URL (including `/v1` if required), `HERMES_API_MODEL` to a model listed by that endpoint (default `hermes-agent`), and `HERMES_API_KEY` in the server environment. Requests go server to server to `/chat/completions`; the browser never receives the configured key. Plain HTTP is accepted only for loopback endpoints by default. For a trusted private-network Hermes endpoint, explicitly set `HERMES_API_ALLOW_PRIVATE_HTTP=1`; use HTTPS for public/remote endpoints. Validate this endpoint against your Hermes installation. Responses must contain JSON content with a bounded `message` and nullable `ops` array. Each operation is `{slide, old, new}` using an exact active field source literal and HTML-escaped replacement text. Proposals appear pending until explicitly applied through the same validation and revision path as direct edits.
 
-Configure the **Hermes API server** with `platform_toolsets.api_server` restricted to safe non-filesystem/non-terminal toolsets, for example:
-
-```yaml
-platform_toolsets:
-  api_server:
-    - web
-```
-
-Verify the configuration and enabled toolsets in your installed Hermes version before starting it. Default API-server tools can access the host, including files and terminal execution. The DeckFoundry app does **not** enforce the Hermes tool policy; a prompt asking for no tools is not a security boundary. Do not connect it to an unrestricted Hermes server. No live Hermes configuration is changed by setup.
+Configure the **Hermes API server** toolsets deliberately. The default API-server toolset can access the host, including files and terminal execution. This app does not enforce or reduce those privileges: Cloudflare Access controls who may reach the app, but any authorized user can send requests to the connected Hermes agent. Use the existing full-tool API only if that capability is intended for the protected users; otherwise configure a restricted `platform_toolsets.api_server` (for example `[web]`) and verify it before connecting. A prompt asking the agent not to use tools is not a security boundary.
 
 Only the selected project name, revision, active slide fields and bounded session conversation are sent, not other slides or project files. Context resets when project, slide or revision changes. Prompts and slide content may be processed by Hermes's configured model provider. Sessions are in memory, expire after an hour of inactivity, and disappear on restart. Authenticate each user separately at the reverse proxy; do not share browser sessions.
 
